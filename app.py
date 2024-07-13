@@ -5,8 +5,6 @@ import requests
 from Bio.Blast import NCBIXML
 import csv
 from Bio.SeqUtils import ProtParam
-import zipfile
-import os
 
 # Function to load proteome data from uploaded FASTA files
 def load_proteome_data(proteome_file):
@@ -35,7 +33,20 @@ def run_blastp_online(query_proteins, subject_proteins):
             'DATABASE': 'nr',
             'QUERY': query_sequences
         })
-        rid_query = response_query.text.split("\n")[2].split("=")[1].strip()
+
+        if response_query.status_code != 200:
+            st.error(f"Error submitting query sequences to BLAST API: {response_query.status_code}")
+            return None, None
+
+        rid_query = None
+        for line in response_query.text.split("\n"):
+            if line.startswith("RID"):
+                rid_query = line.split("=")[1].strip()
+                break
+
+        if not rid_query:
+            st.error("Error retrieving RID for query sequences")
+            return None, None
 
         # Send subject sequences to NCBI BLAST API
         response_subject = requests.post(blast_url, data={
@@ -44,11 +55,23 @@ def run_blastp_online(query_proteins, subject_proteins):
             'DATABASE': 'nr',
             'QUERY': subject_sequences
         })
-        rid_subject = response_subject.text.split("\n")[2].split("=")[1].strip()
+
+        if response_subject.status_code != 200:
+            st.error(f"Error submitting subject sequences to BLAST API: {response_subject.status_code}")
+            return None, None
+
+        rid_subject = None
+        for line in response_subject.text.split("\n"):
+            if line.startswith("RID"):
+                rid_subject = line.split("=")[1].strip()
+                break
+
+        if not rid_subject:
+            st.error("Error retrieving RID for subject sequences")
+            return None, None
 
         # Wait for the BLAST results
         st.info("Waiting for BLAST results. This may take a few minutes.")
-        st.experimental_rerun()  # Rerun the Streamlit script to wait for the BLAST results
 
         while True:
             result_query = requests.get(blast_url, params={'CMD': 'Get', 'RID': rid_query, 'FORMAT_OBJECT': 'SearchInfo'})
@@ -189,16 +212,16 @@ def main():
                     try:
                         mw, theoretical_pI, gravy, instability_index = calculate_properties(sequence)
                         kegg_id = get_kegg_id(protein.id)
-                        kegg_pathways = fetch_kegg_pathways(kegg_id) if kegg_id else ["No KEGG Pathway found"]
+                        kegg_pathways = fetch_kegg_pathways(kegg_id) if kegg_id else []
                         protein_properties[protein.id] = {
                             "Organism": organism,
                             "Molecular Weight": mw,
                             "Theoretical pI": theoretical_pI,
                             "GRAVY Score": gravy,
                             "Instability Index": instability_index,
-                            "KEGG Pathways": "; ".join(kegg_pathways)
+                            "KEGG Pathways": ", ".join(kegg_pathways) if kegg_pathways else "None"
                         }
-                    except ValueError as e:
+                    except Exception as e:
                         st.warning(f"Skipping protein {protein.id} due to error: {e}")
 
                 st.header("Protein Properties")
