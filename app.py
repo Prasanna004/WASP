@@ -11,8 +11,6 @@ import requests
 import zipfile
 import shutil
 
-# Function definitions (paste your functions here)
-
 # Function to load proteome data from uploaded FASTA files
 def load_proteome_data(proteome_file):
     try:
@@ -117,9 +115,9 @@ def fetch_kegg_pathways(kegg_id):
             pathways.append(line.split('\t')[1].strip())
     return pathways
 
-# Home page function
-def home():
-    st.title("WASP: Web-based Approach for Subtractive Proteomics")
+# Streamlit app setup
+def main():
+    st.title("Proteomics Analysis App")
     st.write("---")
 
     # Step 0: Select KEGG ID
@@ -157,7 +155,7 @@ def home():
     host_proteome_file = st.file_uploader("Upload Host Proteome FASTA", type=["fasta"], key="host")
 
     # Run the complete analysis pipeline
-    if st.button("Run Analysis"):
+    if st.button("Run Complete Analysis"):
         if pathogen_proteome_file and host_proteome_file:
             pathogen_proteins = load_proteome_data(pathogen_proteome_file)
             host_proteins = load_proteome_data(host_proteome_file)
@@ -176,185 +174,66 @@ def home():
                 st.header("Prioritizing Essential Proteins")
                 prioritized_proteins = prioritize_essential_proteins(output_result_file, pathogen_proteins)
 
-                # Step 4: Calculate protein properties
-                st.header("Calculating Protein Properties")
+                # Step 4: Calculate protein properties and fetch KEGG pathways
+                st.header("Calculating Protein Properties and Fetching KEGG Pathways")
                 protein_properties = {}
                 for protein in prioritized_proteins:
                     sequence = str(protein.seq)
                     organism = protein.description.split("OS=")[1].split(" ")[0]  # Extract organism name
                     try:
                         mw, theoretical_pI, gravy, instability_index = calculate_properties(sequence)
+                        kegg_id = get_kegg_id(protein.id)
+                        pathways = fetch_kegg_pathways(kegg_id) if kegg_id else ["No KEGG Pathway found"]
                         protein_properties[protein.id] = {
                             "Organism": organism,
                             "Molecular Weight": mw,
                             "Theoretical pI": theoretical_pI,
                             "GRAVY Score": gravy,
-                            "Instability Index": instability_index
+                            "Instability Index": instability_index,
+                            "KEGG Pathways": "; ".join(pathways)
                         }
                     except ValueError as e:
                         st.error(f"Error calculating properties for {protein.id}: {str(e)}")
 
-                # Step 5: Fetch KEGG pathways
-                st.header("Fetching KEGG Pathways")
-                pathways = {}
-                for protein_id, _ in protein_properties.items():
-                    kegg_id = get_kegg_id(protein_id)
-                    if kegg_id:
-                        pathways[protein_id] = fetch_kegg_pathways(kegg_id)
-                    else:
-                        pathways[protein_id] = ["Unclassified"]
-
-                # Step 6: Save results to a folder
+                # Step 5: Save results to a folder
                 st.header("Saving Results")
                 result_folder = "proteomics_results"
                 os.makedirs(result_folder, exist_ok=True)
 
                 # Save BLASTp results
-                blastp_results_path = os.path.join(result_folder, output_result_file)
-                shutil.move(output_result_file, blastp_results_path)
-                st.write(f"BLASTp results saved to {blastp_results_path}")
+                shutil.copy(output_result_file, os.path.join(result_folder, "blastp_results.xml"))
 
-                # Save prioritized essential proteins to FASTA
-                prioritized_proteins_file = os.path.join(result_folder, "prioritized_essential_proteins.fasta")
-                SeqIO.write(prioritized_proteins, prioritized_proteins_file, "fasta")
-                st.write(f"Prioritized essential proteins saved to {prioritized_proteins_file}")
+                # Save prioritized essential proteins
+                prioritized_file = os.path.join(result_folder, "prioritized_essential_proteins.fasta")
+                SeqIO.write(prioritized_proteins, prioritized_file, "fasta")
 
-                # Save protein properties to CSV
-                protein_properties_file = os.path.join(result_folder, "protein_properties.csv")
-                with open(protein_properties_file, "w", newline="") as csvfile:
-                    fieldnames = ["Protein ID", "Organism", "Molecular Weight", "Theoretical pI", "GRAVY Score", "Instability Index"]
+                # Save protein properties with KEGG pathways
+                properties_file = os.path.join(result_folder, "protein_properties.csv")
+                with open(properties_file, mode="w", newline="") as csvfile:
+                    fieldnames = ["Protein ID", "Organism", "Molecular Weight", "Theoretical pI", "GRAVY Score", "Instability Index", "KEGG Pathways"]
                     writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                     writer.writeheader()
                     for protein_id, properties in protein_properties.items():
                         row = {"Protein ID": protein_id}
                         row.update(properties)
                         writer.writerow(row)
-                st.write(f"Protein properties saved to {protein_properties_file}")
 
-                # Save pathways to CSV
-                pathways_file = os.path.join(result_folder, "protein_pathways.csv")
-                with open(pathways_file, "w", newline="") as csvfile:
-                    fieldnames = ["Protein ID", "KEGG Pathways"]
-                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                    writer.writeheader()
-                    for protein_id, kegg_pathways in pathways.items():
-                        row = {"Protein ID": protein_id, "KEGG Pathways": "; ".join(kegg_pathways)}
-                        writer.writerow(row)
-                st.write(f"KEGG pathways saved to {pathways_file}")
+                # Create a zip file of the result folder
+                result_zip = "proteomics_results.zip"
+                with zipfile.ZipFile(result_zip, 'w') as zipf:
+                    for root, _, files in os.walk(result_folder):
+                        for file in files:
+                            zipf.write(os.path.join(root, file), os.path.relpath(os.path.join(root, file), result_folder))
 
-                # Create a ZIP archive of the results
-                zip_filename = "analysis_results.zip"
-                with zipfile.ZipFile(zip_filename, "w") as zipf:
-                    for foldername, subfolders, filenames in os.walk(result_folder):
-                        for filename in filenames:
-                            file_path = os.path.join(foldername, filename)
-                            zipf.write(file_path, os.path.relpath(file_path, result_folder))
+                # Provide download link
+                with open(result_zip, "rb") as zip_file:
+                    st.download_button(label="Download Results", data=zip_file, file_name=result_zip, mime="application/zip")
 
-                st.success(f"Results saved to {zip_filename}")
-
-                # Step 7: Provide download link for the results
-                st.header("Download Results")
-                with open(zip_filename, "rb") as f:
-                    st.download_button("Download ZIP", f, file_name=zip_filename)
+                st.success("Results saved and ready for download.")
+            else:
+                st.error("Error loading proteome data.")
         else:
             st.warning("Please upload both pathogen and host proteome FASTA files.")
-
-# About page function
-def about():
-    st.title("About WASP")
-    st.write(
-        """
-        # About the WASP Code
-
-        WASP (Web-based Approach for Subtractive Proteomics) is a comprehensive bioinformatics tool designed to aid researchers in identifying potential drug targets by comparing the proteome of a pathogen with its host. The application is built using Python and the Streamlit framework, providing an interactive and user-friendly interface for conducting subtractive proteomics analyses.
-
-        ## Code Structure and Features
-
-        ### Main Components
-
-        1. **Home Page**: The main interface where users can:
-           - Select a KEGG ID for the pathogen.
-           - Upload proteome data for both the pathogen and the host.
-           - Run the complete analysis pipeline, including BLASTp analysis, prioritization of essential proteins, calculation of protein properties, and fetching KEGG pathways.
-
-        2. **About Page**: Provides an overview of the WASP tool, its features, and functionality.
-
-        3. **Help Page**: Offers guidance on how to use the WASP tool, including step-by-step instructions and answers to frequently asked questions.
-
-        ### Functions
-
-        1. **load_proteome_data**:
-           - Loads and parses proteome data from uploaded FASTA files.
-           - Handles file content and parses sequences using BioPython.
-
-        2. **run_blastp**:
-           - Executes BLASTp analysis by comparing pathogen proteins against host proteins.
-           - Writes query and subject proteins to temporary FASTA files and runs BLASTp using the `NcbiblastpCommandline`.
-
-        3. **prioritize_essential_proteins**:
-           - Prioritizes essential proteins based on BLASTp results.
-           - Identifies non-homologous proteins and filters essential proteins accordingly.
-
-        4. **calculate_properties**:
-           - Calculates various properties of proteins, including molecular weight, theoretical pI, GRAVY score, and instability index.
-           - Uses BioPython's `ProtParam` module to perform the calculations.
-
-        5. **get_kegg_id**:
-           - Retrieves the KEGG ID for a given UniProt ID by querying the UniProt database.
-
-        6. **fetch_kegg_pathways**:
-           - Fetches KEGG pathways associated with a given KEGG ID by querying the KEGG database.
-
-        ### Analysis Pipeline
-
-        1. **Select Pathogen KEGG ID**:
-           - Users can select a KEGG ID from a predefined list of popular organisms or enter a custom KEGG ID.
-
-        2. **Upload Proteome Data**:
-           - Users upload FASTA files for both the pathogen and host proteomes.
-
-        3. **Run BLASTp Analysis**:
-           - Compares pathogen proteins against host proteins to identify non-homologous proteins.
-
-        4. **Prioritize Essential Proteins**:
-           - Identifies and prioritizes essential proteins based on BLASTp results.
-
-        5. **Calculate Protein Properties**:
-           - Calculates various physicochemical properties of the prioritized essential proteins.
-
-        6. **Fetch KEGG Pathways**:
-           - Retrieves KEGG pathway information for the prioritized proteins.
-
-        7. **Save and Download Results**:
-           - Saves analysis results to a folder and provides an option to download them as a ZIP file.
-
-        ### Usage
-
-        1. **Select Pathogen KEGG ID**: Choose from a dropdown menu or enter a custom KEGG ID.
-        2. **Upload Proteome Data**: Upload FASTA files for the pathogen and host proteomes.
-        3. **Run Analysis**: Click the 'Run Analysis' button to start the analysis pipeline.
-        4. **Download Results**: After the analysis completes, download the results as a ZIP file.
-
-        For more information, please visit the [GitHub repository](https://github.com/username/WASP).
-        """
-    )
-
-# Help page function
-def help_page():
-    st.title("Help")
-    st.write("Here you can provide help content and FAQs for your users.")
-
-# Main app
-def main():
-    st.sidebar.title("Navigation")
-    pages = {
-        "Home": home,
-        "About": about,
-        "Help": help_page
-    }
-    selection = st.sidebar.radio("Go to", list(pages.keys()))
-    page = pages[selection]
-    page()
 
 if __name__ == "__main__":
     main()
