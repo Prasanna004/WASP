@@ -1,73 +1,88 @@
 import streamlit as st
 from Bio import SeqIO
 from io import StringIO
-from Bio.Blast.Applications import NcbiblastpCommandline
+import requests
 from Bio.Blast import NCBIXML
-import os
-import tempfile
 import csv
 from Bio.SeqUtils import ProtParam
-import requests
 import zipfile
-import shutil
+import os
 
 # Function to load proteome data from uploaded FASTA files
 def load_proteome_data(proteome_file):
     try:
-        # Read file content
         proteome_content = proteome_file.read().decode("utf-8")
-        
-        # Use StringIO to handle FASTA content
         proteome_stream = StringIO(proteome_content)
-        
-        # Parse sequences
         proteome_sequences = list(SeqIO.parse(proteome_stream, "fasta"))
-        
         return proteome_sequences
     except Exception as e:
         st.error(f"Error loading proteome data from {proteome_file.name}: {e}")
         return None
 
-# Function to run BLASTp analysis
-def run_blastp(query_proteins, subject_proteins, output_file):
+# Function to run BLASTp analysis using NCBI BLAST API
+def run_blastp_online(query_proteins, subject_proteins):
     try:
-        # Write query and subject proteins to temporary FASTA files
-        temp_dir = tempfile.TemporaryDirectory()
-        query_file = os.path.join(temp_dir.name, "query_proteins.fasta")
-        subject_file = os.path.join(temp_dir.name, "subject_proteins.fasta")
+        query_sequences = "\n".join([f">{seq.id}\n{seq.seq}" for seq in query_proteins])
+        subject_sequences = "\n".join([f">{seq.id}\n{seq.seq}" for seq in subject_proteins])
 
-        SeqIO.write(query_proteins, query_file, "fasta")
-        SeqIO.write(subject_proteins, subject_file, "fasta")
+        # NCBI BLAST API URL
+        blast_url = "https://blast.ncbi.nlm.nih.gov/Blast.cgi"
 
-        # Run BLASTp
-        blastp_cline = NcbiblastpCommandline(query=query_file, subject=subject_file, outfmt=5, out=output_file)
-        stdout, stderr = blastp_cline()
+        # Send query sequences to NCBI BLAST API
+        response_query = requests.post(blast_url, data={
+            'CMD': 'Put',
+            'PROGRAM': 'blastp',
+            'DATABASE': 'nr',
+            'QUERY': query_sequences
+        })
+        rid_query = response_query.text.split("\n")[2].split("=")[1].strip()
 
-        # Remove temporary directory
-        temp_dir.cleanup()
+        # Send subject sequences to NCBI BLAST API
+        response_subject = requests.post(blast_url, data={
+            'CMD': 'Put',
+            'PROGRAM': 'blastp',
+            'DATABASE': 'nr',
+            'QUERY': subject_sequences
+        })
+        rid_subject = response_subject.text.split("\n")[2].split("=")[1].strip()
 
-        if stderr:
-            st.error(stderr)
-            return False
-        else:
-            st.success(f"BLASTp results saved to {output_file}")
-            return True
+        # Wait for the BLAST results
+        st.info("Waiting for BLAST results. This may take a few minutes.")
+        st.experimental_rerun()  # Rerun the Streamlit script to wait for the BLAST results
+
+        while True:
+            result_query = requests.get(blast_url, params={'CMD': 'Get', 'RID': rid_query, 'FORMAT_OBJECT': 'SearchInfo'})
+            if 'Status=READY' in result_query.text:
+                break
+            st.info("Waiting for query BLAST results...")
+
+        while True:
+            result_subject = requests.get(blast_url, params={'CMD': 'Get', 'RID': rid_subject, 'FORMAT_OBJECT': 'SearchInfo'})
+            if 'Status=READY' in result_subject.text:
+                break
+            st.info("Waiting for subject BLAST results...")
+
+        # Fetch the BLAST results
+        result_query = requests.get(blast_url, params={'CMD': 'Get', 'RID': rid_query, 'FORMAT_TYPE': 'XML'})
+        result_subject = requests.get(blast_url, params={'CMD': 'Get', 'RID': rid_subject, 'FORMAT_TYPE': 'XML'})
+
+        return result_query.text, result_subject.text
+
     except Exception as e:
         st.error(f"Error running BLASTp: {e}")
-        return False
+        return None, None
 
 # Function to prioritize essential proteins based on BLASTp results
-def prioritize_essential_proteins(blastp_results_file, pathogen_proteins):
+def prioritize_essential_proteins(blastp_results_query, blastp_results_subject, pathogen_proteins):
     try:
-        # Parse non-homologous proteins from BLASTp results
-        with open(blastp_results_file) as result_handle:
-            blast_records = NCBIXML.parse(result_handle)
-            non_homologous_proteins = set()
-            for blast_record in blast_records:
-                if not blast_record.alignments:
-                    non_homologous_proteins.add(blast_record.query.split()[0])
+        query_records = NCBIXML.read(StringIO(blastp_results_query))
+        subject_records = NCBIXML.read(StringIO(blastp_results_subject))
 
-        # Filter and prioritize essential proteins
+        non_homologous_proteins = set()
+        for query_record in query_records:
+            if not query_record.alignments:
+                non_homologous_proteins.add(query_record.query.split()[0])
+
         prioritized_proteins = [protein for protein in pathogen_proteins if protein.id in non_homologous_proteins]
 
         st.success(f"Prioritized {len(prioritized_proteins)} essential proteins based on BLASTp results.")
@@ -79,15 +94,12 @@ def prioritize_essential_proteins(blastp_results_file, pathogen_proteins):
 
 # Function to calculate protein properties
 def calculate_properties(sequence):
-    # Check if the sequence contains only valid amino acid residues
     valid_residues = set("ACDEFGHIKLMNPQRSTVWY")
     if not set(sequence).issubset(valid_residues):
         raise ValueError(f"Invalid sequence: {sequence}. Contains non-standard characters.")
 
-    # Create a ProteinAnalysis object
     protein_analysis = ProtParam.ProteinAnalysis(sequence)
 
-    # Calculate properties
     mw = protein_analysis.molecular_weight()
     theoretical_pI = protein_analysis.isoelectric_point()
     gravy_score = protein_analysis.gravy()
@@ -120,7 +132,6 @@ def main():
     st.title("Proteomics Analysis App")
     st.write("---")
 
-    # Step 0: Select KEGG ID
     st.header("Select Pathogen KEGG ID")
     popular_organisms = {
         "Escherichia coli (k12)": "eco",
@@ -149,89 +160,76 @@ def main():
     st.write(f"Selected KEGG ID: {kegg_id}")
     st.write("---")
 
-    # Step 1: Upload proteome data
     st.header("Upload Proteome Data")
     pathogen_proteome_file = st.file_uploader("Upload Pathogen Proteome FASTA", type=["fasta"], key="pathogen")
     host_proteome_file = st.file_uploader("Upload Host Proteome FASTA", type=["fasta"], key="host")
 
-    # Run the complete analysis pipeline
     if st.button("Run Complete Analysis"):
         if pathogen_proteome_file and host_proteome_file:
             pathogen_proteins = load_proteome_data(pathogen_proteome_file)
             host_proteins = load_proteome_data(host_proteome_file)
 
             if pathogen_proteins and host_proteins:
-                # Step 2: Run BLASTp analysis
                 st.header("Running BLASTp Analysis")
-                output_result_file = "blastp_results.xml"
-                if run_blastp(pathogen_proteins, host_proteins, output_result_file):
+                blastp_results_query, blastp_results_subject = run_blastp_online(pathogen_proteins, host_proteins)
+                if blastp_results_query and blastp_results_subject:
                     st.success("BLASTp analysis completed successfully.")
                 else:
                     st.error("BLASTp analysis failed.")
                     st.stop()
 
-                # Step 3: Prioritize essential proteins based on BLASTp results
                 st.header("Prioritizing Essential Proteins")
-                prioritized_proteins = prioritize_essential_proteins(output_result_file, pathogen_proteins)
+                prioritized_proteins = prioritize_essential_proteins(blastp_results_query, blastp_results_subject, pathogen_proteins)
 
-                # Step 4: Calculate protein properties and fetch KEGG pathways
-                st.header("Calculating Protein Properties and Fetching KEGG Pathways")
+                st.header("Calculating Protein Properties")
                 protein_properties = {}
                 for protein in prioritized_proteins:
                     sequence = str(protein.seq)
-                    organism = protein.description.split("OS=")[1].split(" ")[0]  # Extract organism name
+                    organism = protein.description.split("OS=")[1].split(" ")[0]
                     try:
                         mw, theoretical_pI, gravy, instability_index = calculate_properties(sequence)
                         kegg_id = get_kegg_id(protein.id)
-                        pathways = fetch_kegg_pathways(kegg_id) if kegg_id else ["No KEGG Pathway found"]
+                        kegg_pathways = fetch_kegg_pathways(kegg_id) if kegg_id else ["No KEGG Pathway found"]
                         protein_properties[protein.id] = {
                             "Organism": organism,
                             "Molecular Weight": mw,
                             "Theoretical pI": theoretical_pI,
                             "GRAVY Score": gravy,
                             "Instability Index": instability_index,
-                            "KEGG Pathways": "; ".join(pathways)
+                            "KEGG Pathways": "; ".join(kegg_pathways)
                         }
                     except ValueError as e:
-                        st.error(f"Error calculating properties for {protein.id}: {str(e)}")
+                        st.warning(f"Skipping protein {protein.id} due to error: {e}")
 
-                # Step 5: Save results to a folder
-                st.header("Saving Results")
-                result_folder = "proteomics_results"
-                os.makedirs(result_folder, exist_ok=True)
+                st.header("Protein Properties")
+                st.write(protein_properties)
 
-                # Save BLASTp results
-                shutil.copy(output_result_file, os.path.join(result_folder, "blastp_results.xml"))
+                st.header("Download Results")
+                csv_buffer = StringIO()
+                csv_writer = csv.writer(csv_buffer)
+                csv_writer.writerow(["Protein ID", "Organism", "Molecular Weight", "Theoretical pI", "GRAVY Score", "Instability Index", "KEGG Pathways"])
+                for protein_id, properties in protein_properties.items():
+                    csv_writer.writerow([
+                        protein_id,
+                        properties["Organism"],
+                        properties["Molecular Weight"],
+                        properties["Theoretical pI"],
+                        properties["GRAVY Score"],
+                        properties["Instability Index"],
+                        properties["KEGG Pathways"]
+                    ])
 
-                # Save prioritized essential proteins
-                prioritized_file = os.path.join(result_folder, "prioritized_essential_proteins.fasta")
-                SeqIO.write(prioritized_proteins, prioritized_file, "fasta")
+                csv_buffer.seek(0)
+                st.download_button(
+                    label="Download Protein Properties CSV",
+                    data=csv_buffer,
+                    file_name="protein_properties.csv",
+                    mime="text/csv"
+                )
 
-                # Save protein properties with KEGG pathways
-                properties_file = os.path.join(result_folder, "protein_properties.csv")
-                with open(properties_file, mode="w", newline="") as csvfile:
-                    fieldnames = ["Protein ID", "Organism", "Molecular Weight", "Theoretical pI", "GRAVY Score", "Instability Index", "KEGG Pathways"]
-                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                    writer.writeheader()
-                    for protein_id, properties in protein_properties.items():
-                        row = {"Protein ID": protein_id}
-                        row.update(properties)
-                        writer.writerow(row)
-
-                # Create a zip file of the result folder
-                result_zip = "proteomics_results.zip"
-                with zipfile.ZipFile(result_zip, 'w') as zipf:
-                    for root, _, files in os.walk(result_folder):
-                        for file in files:
-                            zipf.write(os.path.join(root, file), os.path.relpath(os.path.join(root, file), result_folder))
-
-                # Provide download link
-                with open(result_zip, "rb") as zip_file:
-                    st.download_button(label="Download Results", data=zip_file, file_name=result_zip, mime="application/zip")
-
-                st.success("Results saved and ready for download.")
+                st.success("Analysis completed successfully.")
             else:
-                st.error("Error loading proteome data.")
+                st.error("Failed to load proteome data.")
         else:
             st.warning("Please upload both pathogen and host proteome FASTA files.")
 
